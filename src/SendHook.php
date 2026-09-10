@@ -3,7 +3,7 @@
 namespace Weft;
 
 /**
- * Optional before/after seam around each HTTP send.
+ * Optional before/after seam around each HTTP request.
  * before() returning a Result skips curl and delivers that result to the fiber.
  * after() runs only for requests that actually transferred.
  */

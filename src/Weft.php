@@ -10,16 +10,16 @@ use Throwable;
 /**
  * Fiber scheduler over one long-lived curl_multi handle.
  *
- * Workflows are plain callables that call send(); a send suspends the workflow,
- * its handles join requests already in flight, and it resumes as soon as its own
- * handles finish — no barrier across workflows.
+ * Workflows are plain callables that call request(); a request suspends the
+ * workflow, its handle joins others already in flight, and it resumes as soon
+ * as its own handle finishes — no barrier across workflows.
  *
- *   $client->run(
- *       fn() => $api->doThing($idA),
- *       fn() => $api->doOther($idB),
+ *   $weft->run(
+ *       fn() => $weft->request(method: 'GET', url: 'https://example.com/a'),
+ *       fn() => $weft->request(method: 'GET', url: 'https://example.com/b'),
  *   );
  */
-final class Client {
+final class Weft {
 	public const int DEFAULT_CONCURRENCY = 25;
 	public const float DEFAULT_TIMEOUT = 30.0;
 	public const float DEFAULT_CONNECT_TIMEOUT = 10.0;
@@ -33,7 +33,7 @@ final class Client {
 	 * @var array<int, array{
 	 *   index: int,
 	 *   fiber: Fiber,
-	 *   responses: array<int, Result>,
+	 *   result: ?Result,
 	 *   pending: int,
 	 * }>
 	 */
@@ -44,7 +44,6 @@ final class Client {
 	 *
 	 * @var array<int, array{
 	 *   fiberId: int,
-	 *   index: int,
 	 *   request: Request,
 	 *   attempt: int,
 	 *   startedAt: float,
@@ -90,25 +89,31 @@ final class Client {
 	}
 
 	/**
-	 * Send one or more requests. Inside run() this suspends the fiber until each
-	 * handle finishes (and retries transport/5xx per setRetries). Outside run()
-	 * it is a one-shot run of a single send.
+	 * One HTTP call. Inside run() this suspends the fiber until the handle
+	 * finishes (and retries transport/5xx per setRetries). Outside run() it is
+	 * a one-shot run of a single request.
 	 *
-	 * @return list<Result>
+	 * @param array<string, mixed> $body
+	 * @param array<string, mixed> $context Opaque hook/caller metadata
 	 */
-	public function send(Request ...$requests): array {
-		if (!$requests) return [];
+	public function request(string $method, string $url, array $body = [], array $context = []): Result {
+		$request = new Request(method: $method, url: $url, body: $body, context: $context);
 
 		$fiber = Fiber::getCurrent();
 		if ($fiber !== null && isset($this->tasks[spl_object_id($fiber)])) {
-			return Fiber::suspend(array_values($requests));
+			return Fiber::suspend($request);
 		}
 
-		return $this->run(fn() => $this->send(...$requests))[0];
+		return $this->run(fn() => $this->request(
+			method: $method,
+			url: $url,
+			body: $body,
+			context: $context,
+		))[0];
 	}
 
 	/**
-	 * Run workflows concurrently. Each is a plain callable that calls send().
+	 * Run workflows concurrently. Each is a plain callable that calls request().
 	 * Failed workflows yield their Throwable as the result for that index — run
 	 * itself does not throw, so sibling results stay available.
 	 *
@@ -134,7 +139,7 @@ final class Client {
 				$this->tasks[$fiberId] = [
 					'index' => $i,
 					'fiber' => $fiber,
-					'responses' => [],
+					'result' => null,
 					'pending' => 0,
 				];
 				$active[$i] = $fiberId;
@@ -163,7 +168,7 @@ final class Client {
 			$fiber = $task['fiber'];
 
 			try {
-				$requests = $step($fiber);
+				$suspended = $step($fiber);
 			} catch (Throwable $e) {
 				$results[$task['index']] = $e;
 				unset($active[$task['index']], $this->tasks[$fiberId]);
@@ -176,7 +181,7 @@ final class Client {
 				return;
 			}
 
-			$denied = $this->enqueue(fiberId: $fiberId, requests: $requests);
+			$denied = $this->enqueue(fiberId: $fiberId, request: $suspended);
 			if ($task['pending'] > 0) return;
 
 			$step = fn(Fiber $f) => $f->resume($denied);
@@ -184,36 +189,27 @@ final class Client {
 	}
 
 	/**
-	 * @param list<Request> $requests
-	 * @return list<Result>
+	 * @return Result|null Immediate result when the hook skips HTTP; null when a handle was queued.
 	 */
-	private function enqueue(int $fiberId, array $requests): array {
+	private function enqueue(int $fiberId, Request $request): ?Result {
 		$task = &$this->tasks[$fiberId];
-		$task['responses'] = [];
+		$task['result'] = null;
 		$task['pending'] = 0;
 
-		foreach ($requests as $index => $request) {
-			if ($this->hook !== null) {
-				$skip = $this->hook->before($request);
-				if ($skip !== null) {
-					$task['responses'][$index] = $skip;
-					continue;
-				}
-			}
-
-			$this->addHandle(fiberId: $fiberId, index: $index, request: $request, attempt: 1);
+		if ($this->hook !== null) {
+			$skip = $this->hook->before($request);
+			if ($skip !== null) return $skip;
 		}
 
-		ksort($task['responses']);
-		return array_values($task['responses']);
+		$this->addHandle(fiberId: $fiberId, request: $request, attempt: 1);
+		return null;
 	}
 
-	private function addHandle(int $fiberId, int $index, Request $request, int $attempt): void {
+	private function addHandle(int $fiberId, Request $request, int $attempt): void {
 		$handle = $this->createHandle(request: $request);
 		curl_multi_add_handle($this->multi, $handle);
 		$this->inFlight[spl_object_id($handle)] = [
 			'fiberId' => $fiberId,
-			'index' => $index,
 			'request' => $request,
 			'attempt' => $attempt,
 			'startedAt' => microtime(true),
@@ -263,14 +259,13 @@ final class Client {
 			$this->tasks[$fiberId]['pending']--;
 			$this->addHandle(
 				fiberId: $fiberId,
-				index: $slot['index'],
 				request: $slot['request'],
 				attempt: $slot['attempt'] + 1,
 			);
 			return;
 		}
 
-		$this->tasks[$fiberId]['responses'][$slot['index']] = $result;
+		$this->tasks[$fiberId]['result'] = $result;
 		$this->tasks[$fiberId]['pending']--;
 		$this->maybeResume(fiberId: $fiberId, active: $active, results: $results);
 	}
@@ -282,11 +277,10 @@ final class Client {
 	private function maybeResume(int $fiberId, array &$active, array &$results): void {
 		if ($this->tasks[$fiberId]['pending'] > 0) return;
 
-		ksort($this->tasks[$fiberId]['responses']);
-		$responses = array_values($this->tasks[$fiberId]['responses']);
+		$result = $this->tasks[$fiberId]['result'];
 		$this->advance(
 			fiberId: $fiberId,
-			step: fn(Fiber $fiber) => $fiber->resume($responses),
+			step: fn(Fiber $fiber) => $fiber->resume($result),
 			active: $active,
 			results: $results,
 		);

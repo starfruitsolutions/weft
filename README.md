@@ -1,46 +1,46 @@
 # Weft
 
-Concurrent HTTP for PHP 8.4+. On a loom, the weft is the yarn that runs across the warp. Here, requests and workflows are the threads: they share one `curl_multi` handle and resume as they finish.
+Concurrent HTTP for PHP 8.4+. On a loom, the weft is the yarn that runs across the warp. Here, workflows share one `curl_multi` handle and resume as their own transfers finish.
 
-**Direct:** several independent requests, one hop. Pass them all to `send()`.
+`request()` is one HTTP call. `run()` overlaps several callables that each call `request()`.
+
+**Direct:** several independent requests. One `request()` per closure.
 
 ```php
-use Weft\Client;
-use Weft\Request;
+use Weft\Weft;
 
-$client = new Client();
+$weft = new Weft();
 
-[$a, $b] = $client->send(
-	new Request(method: 'GET', url: 'https://example.com/a'),
-	new Request(method: 'GET', url: 'https://example.com/b'),
+[$a, $b] = $weft->run(
+	fn() => $weft->request(method: 'GET', url: 'https://example.com/a'),
+	fn() => $weft->request(method: 'GET', url: 'https://example.com/b'),
 );
 ```
 
-**Composed:** several multi-step procedures that may branch between hops. Pass a closure per procedure to `run()`. Each closure is sequential; `send()` inside it suspends so the other closures can keep going.
+**Composed:** several multi-step procedures that may branch between hops. Each closure is sequential; `request()` inside it suspends so the other closures can keep going.
 
 ```php
-[$orderA, $orderB] = $client->run(
-	fn() => $this->submitOrder($client, $idA),
-	fn() => $this->submitOrder($client, $idB),
+[$orderA, $orderB] = $weft->run(
+	fn() => $this->submitOrder($weft, $idA),
+	fn() => $this->submitOrder($weft, $idB),
 );
 
-function submitOrder(Client $client, string $id): Result {
-	[$submit] = $client->send(new Request(
+function submitOrder(Weft $weft, string $id): Result {
+	$submit = $weft->request(
 		method: 'POST',
 		url: "https://api.example.com/orders/{$id}",
-	));
+	);
 	if (!$submit->isError()) return $submit;
 
-	[$retry] = $client->send(new Request(
+	return $weft->request(
 		method: 'POST',
 		url: "https://api.example.com/orders/{$id}",
 		body: ['force' => true],
-	));
-	return $retry;
+	);
 }
 ```
 
-Fan-out of requests → `send(...)`. Fan-out of procedures → `run(fn() => ...)`.
+`request()` outside `run()` is a one-shot of a single call.
 
 ## Install
 
@@ -67,26 +67,22 @@ Until the package is on Packagist, add the GitHub repo:
 
 Requires PHP 8.4+, `ext-curl`, and `ext-json`.
 
-## Requests
+## request()
 
-Bodies are JSON. `context` is opaque to the client — hooks may read keys they care about.
+Bodies are JSON. `context` is opaque to Weft — hooks may read keys they care about.
 
 ```php
-$request = new Request(
+$result = $weft->request(
 	method: 'POST',
 	url: 'https://api.example.com/items',
-	body: ['name' => 'Track'],
+	body: ['name' => 'Widget'],
 	context: ['pool' => 'writes', 'label' => 'createItem'],
 );
 ```
 
-## Results
-
 JSON object responses are `ArrayAccess`. Non-JSON bodies and empty responses become an `error` payload. `httpCode` is the transport status (`0` on failure).
 
 ```php
-$result = $client->send($request)[0];
-
 if ($result->isError()) {
 	// $result['error']
 }
@@ -95,20 +91,18 @@ $code = $result->httpCode;
 $array = $result->toArray();
 ```
 
-`Result::QuotaExceeded($pool, $retryAt)` builds a 429 without performing HTTP, for hooks that deny a send up front.
+`Result::QuotaExceeded($pool, $retryAt)` builds a 429 without performing HTTP, for hooks that deny a request up front.
 
 ## Workflows
 
 `run()` starts one fiber per callable. A workflow that throws is stored as that `Throwable` at its index; `run()` itself does not throw, so sibling results stay available.
 
-Inside a workflow, `send(...$requests)` suspends until every handle in *that* call finishes. Other workflows keep transferring on the same `curl_multi`. A `send()` with several arguments is still one hop: those requests complete together before the closure continues.
-
-`send()` outside `run()` is a one-shot of that same hop.
+Inside a workflow, `request()` suspends until that handle finishes. Other workflows keep transferring on the same `curl_multi`.
 
 Workflow concurrency (not request count) defaults to 25:
 
 ```php
-$client->setConcurrency(50);
+$weft->setConcurrency(50);
 ```
 
 ## Retries
@@ -116,18 +110,19 @@ $client->setConcurrency(50);
 Extra attempts for transport failures (`httpCode` 0) and 5xx. Default is 0. Retries re-send; they do not re-run `SendHook::before()`.
 
 ```php
-$client = new Client(retries: 2);
-// or later: $client->setRetries(2);
+$weft = new Weft(retries: 2);
+// or later: $weft->setRetries(2);
 ```
 
 ## Hooks
 
-`SendHook` is a before/after seam. `before()` returning a `Result` skips curl. `after()` runs only for requests that actually transferred.
+`SendHook` is a before/after seam. `before()` returning a `Result` skips curl. `after()` runs only for requests that actually transferred. Hooks see the internal `Request` object.
 
 ```php
 use Weft\Request;
 use Weft\Result;
 use Weft\SendHook;
+use Weft\Weft;
 
 final class RateLimitHook implements SendHook {
 	public function before(Request $request): ?Result {
@@ -141,13 +136,13 @@ final class RateLimitHook implements SendHook {
 	}
 }
 
-$client = new Client(hook: new RateLimitHook());
+$weft = new Weft(hook: new RateLimitHook());
 ```
 
 Default headers are a callable invoked per handle (auth tokens, etc.):
 
 ```php
-$client = new Client(
+$weft = new Weft(
 	defaultHeaders: fn(): array => ['Authorization: Bearer ' . $this->token()],
 );
 ```

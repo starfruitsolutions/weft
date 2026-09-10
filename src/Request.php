@@ -3,9 +3,9 @@
 namespace Weft;
 
 /**
- * Immutable HTTP request for Client::send().
+ * Immutable HTTP request used internally by Weft and SendHooks.
  *
- * $context is opaque to the client — SendHooks may read keys they care about.
+ * $context is opaque to Weft — SendHooks may read keys they care about.
  * Leave empty when unused.
  */
 final class Request {
