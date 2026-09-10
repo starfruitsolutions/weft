@@ -2,7 +2,7 @@
 
 Concurrent HTTP for PHP 8.4+. On a loom, the weft is the yarn that runs across the warp. Here, workflows share one `curl_multi` handle and resume as their own transfers finish.
 
-`request()` is one HTTP call. `run()` overlaps several callables that each call `request()`.
+`request()` is one HTTP call. `run()` overlaps several callables that each call `request()` and/or nested `run()`. Nested `run()` joins children on the same event loop, so siblings keep making progress.
 
 **Direct:** several independent requests. One `request()` per closure.
 
@@ -40,7 +40,20 @@ function submitOrder(Weft $weft, string $id): Result {
 }
 ```
 
-`request()` outside `run()` is a one-shot of a single call.
+`request()` outside `run()` is a one-shot of a single call. If that workflow throws, `request()` rethrows.
+
+A procedure can nest `run()` for a fan-out in the middle of a sequence:
+
+```php
+function loadOrder(Weft $weft, string $id): array {
+	$order = $weft->request(method: 'GET', url: "https://api.example.com/orders/{$id}");
+	[$items, $customer] = $weft->run(
+		fn() => $weft->request(method: 'GET', url: "https://api.example.com/orders/{$id}/items"),
+		fn() => $weft->request(method: 'GET', url: "https://api.example.com/customers/{$order['customerId']}"),
+	);
+	return [$order, $items, $customer];
+}
+```
 
 ## Install
 
@@ -97,9 +110,9 @@ $array = $result->toArray();
 
 `run()` starts one fiber per callable. A workflow that throws is stored as that `Throwable` at its index; `run()` itself does not throw, so sibling results stay available.
 
-Inside a workflow, `request()` suspends until that handle finishes. Other workflows keep transferring on the same `curl_multi`.
+Inside a workflow, `request()` suspends until that handle finishes. Nested `run()` suspends the parent until its children finish. Other workflows keep transferring on the same `curl_multi`.
 
-Workflow concurrency (not request count) defaults to 25:
+Workflow concurrency (not request count) defaults to 25. Parents waiting on a nested `run()` do not count toward the limit:
 
 ```php
 $weft->setConcurrency(50);
@@ -139,7 +152,7 @@ final class RateLimitHook implements SendHook {
 $weft = new Weft(hook: new RateLimitHook());
 ```
 
-Default headers are a callable invoked per handle (auth tokens, etc.):
+Default headers are a callable invoked once per root `run()` and reused for every handle in that run (auth tokens, etc.):
 
 ```php
 $weft = new Weft(

@@ -10,9 +10,10 @@ use Throwable;
 /**
  * Fiber scheduler over one long-lived curl_multi handle.
  *
- * Workflows are plain callables that call request(); a request suspends the
- * workflow, its handle joins others already in flight, and it resumes as soon
- * as its own handle finishes — no barrier across workflows.
+ * Workflows are plain callables that call request() and/or nested run().
+ * request() suspends until its handle finishes; nested run() suspends the
+ * parent until its children finish — both share one event loop so siblings
+ * keep making progress.
  *
  *   $weft->run(
  *       fn() => $weft->request(method: 'GET', url: 'https://example.com/a'),
@@ -35,6 +36,9 @@ final class Weft {
 	 *   fiber: Fiber,
 	 *   result: ?Result,
 	 *   pending: int,
+	 *   parentId: ?int,
+	 *   joinLeft?: int,
+	 *   joinResults?: array<int, mixed>,
 	 * }>
 	 */
 	private array $tasks = [];
@@ -50,6 +54,12 @@ final class Weft {
 	 * }>
 	 */
 	private array $inFlight = [];
+
+	/** @var list<int> fiber ids waiting to be started */
+	private array $startQueue = [];
+
+	/** Resolved once per root run() and reused for every handle in that run. */
+	private ?array $runHeaders = null;
 
 	private int $concurrency = self::DEFAULT_CONCURRENCY;
 
@@ -80,6 +90,7 @@ final class Weft {
 
 	/**
 	 * Max workflows started at once inside run(). Caps tasks in flight, not requests.
+	 * Parents waiting on a nested run() do not count toward this limit.
 	 *
 	 * @api
 	 */
@@ -104,54 +115,120 @@ final class Weft {
 			return Fiber::suspend($request);
 		}
 
-		return $this->run(fn() => $this->request(
+		$result = $this->run(fn() => $this->request(
 			method: $method,
 			url: $url,
 			body: $body,
 			context: $context,
 		))[0];
+		if ($result instanceof Throwable) throw $result;
+		return $result;
 	}
 
 	/**
-	 * Run workflows concurrently. Each is a plain callable that calls request().
-	 * Failed workflows yield their Throwable as the result for that index — run
-	 * itself does not throw, so sibling results stay available.
+	 * Run workflows concurrently. Each is a plain callable that calls request()
+	 * and/or nested run(). Failed workflows yield their Throwable as the result
+	 * for that index — run itself does not throw, so sibling results stay available.
+	 *
+	 * Nested run() from inside a managed fiber joins children on the same
+	 * event loop (siblings keep progressing).
 	 *
 	 * @return list<mixed> return values (or Throwable) in workflow order
 	 */
 	public function run(callable ...$workflows): array {
 		if (!$workflows) return [];
 
-		$this->multi ??= curl_multi_init();
+		$workflows = array_values($workflows);
+		$fiber = Fiber::getCurrent();
+		if ($fiber !== null && isset($this->tasks[spl_object_id($fiber)])) {
+			return $this->awaitChildren(parentId: spl_object_id($fiber), workflows: $workflows);
+		}
 
-		$queue = array_values($workflows);
-		/** @var array<int, int> workflow index => fiber id */
+		return $this->drive(workflows: $workflows);
+	}
+
+	/**
+	 * @param list<callable> $workflows
+	 * @return list<mixed>
+	 */
+	private function awaitChildren(int $parentId, array $workflows): array {
+		$childIds = [];
+		foreach ($workflows as $i => $workflow) {
+			$fiber = new Fiber($workflow);
+			$childId = spl_object_id($fiber);
+			$this->tasks[$childId] = [
+				'index' => $i,
+				'fiber' => $fiber,
+				'result' => null,
+				'pending' => 0,
+				'parentId' => $parentId,
+			];
+			$childIds[] = $childId;
+			$this->startQueue[] = $childId;
+		}
+
+		$this->tasks[$parentId]['joinLeft'] = count($childIds);
+		$this->tasks[$parentId]['joinResults'] = [];
+
+		return Fiber::suspend(new Join(childIds: $childIds));
+	}
+
+	/**
+	 * @param list<callable> $workflows
+	 * @return list<mixed>
+	 */
+	private function drive(array $workflows): array {
+		$this->multi ??= curl_multi_init();
+		$this->runHeaders = null;
+		$this->startQueue = [];
+
+		/** @var array<int, true> fiber id => true */
 		$active = [];
 		$results = [];
 		$next = 0;
-		$total = count($queue);
+		$total = count($workflows);
 
-		$startNext = function () use (&$queue, &$active, &$next, &$results, $total): void {
-			while (count($active) < $this->concurrency && $next < $total) {
-				$i = $next++;
-				$fiber = new Fiber($queue[$i]);
-				$fiberId = spl_object_id($fiber);
-				$this->tasks[$fiberId] = [
-					'index' => $i,
-					'fiber' => $fiber,
-					'result' => null,
-					'pending' => 0,
-				];
-				$active[$i] = $fiberId;
-				$this->advance(fiberId: $fiberId, step: fn(Fiber $f) => $f->start(), active: $active, results: $results);
+		try {
+			while ($next < $total || $active || $this->inFlight || $this->startQueue) {
+				while (
+					$next < $total
+					&& $this->busyCount(active: $active) + $this->queuedUnstarted(active: $active) < $this->concurrency
+				) {
+					$i = $next++;
+					$fiber = new Fiber($workflows[$i]);
+					$fiberId = spl_object_id($fiber);
+					$this->tasks[$fiberId] = [
+						'index' => $i,
+						'fiber' => $fiber,
+						'result' => null,
+						'pending' => 0,
+						'parentId' => null,
+					];
+					$this->startQueue[] = $fiberId;
+				}
+
+				$this->startQueued(active: $active, results: $results);
+
+				if ($this->inFlight) {
+					$this->tick(active: $active, results: $results);
+					continue;
+				}
+
+				if ($this->startQueue !== [] || $next < $total) continue;
+
+				// Active fibers but nothing runnable — should be unreachable.
+				foreach (array_keys($active) as $fiberId) {
+					$this->finish(
+						fiberId: $fiberId,
+						value: new \LogicException('Weft event loop stalled with active fibers'),
+						active: $active,
+						results: $results,
+					);
+				}
 			}
-		};
-
-		$startNext();
-
-		while ($active || $this->inFlight) {
-			if ($this->inFlight) $this->tick(active: $active, results: $results);
-			$startNext();
+		} finally {
+			$this->runHeaders = null;
+			$this->startQueue = [];
 		}
 
 		ksort($results);
@@ -159,7 +236,55 @@ final class Weft {
 	}
 
 	/**
-	 * @param array<int, int> $active
+	 * Fibers that consume a concurrency slot (excludes parents waiting on nested run).
+	 *
+	 * @param array<int, true> $active
+	 */
+	private function busyCount(array $active): int {
+		$n = 0;
+		foreach (array_keys($active) as $fiberId) {
+			if (($this->tasks[$fiberId]['joinLeft'] ?? 0) > 0) continue;
+			$n++;
+		}
+		return $n;
+	}
+
+	/**
+	 * Start-queue entries not yet moved into $active.
+	 *
+	 * @param array<int, true> $active
+	 */
+	private function queuedUnstarted(array $active): int {
+		$n = 0;
+		foreach ($this->startQueue as $fiberId) {
+			if (!isset($active[$fiberId])) $n++;
+		}
+		return $n;
+	}
+
+	/**
+	 * @param array<int, true> $active
+	 * @param array<int, mixed> $results
+	 */
+	private function startQueued(array &$active, array &$results): void {
+		while ($this->startQueue !== []) {
+			if ($this->busyCount(active: $active) >= $this->concurrency) break;
+
+			$fiberId = array_shift($this->startQueue);
+			if (!isset($this->tasks[$fiberId])) continue;
+
+			$active[$fiberId] = true;
+			$this->advance(
+				fiberId: $fiberId,
+				step: fn(Fiber $fiber) => $fiber->start(),
+				active: $active,
+				results: $results,
+			);
+		}
+	}
+
+	/**
+	 * @param array<int, true> $active
 	 * @param array<int, mixed> $results
 	 */
 	private function advance(int $fiberId, callable $step, array &$active, array &$results): void {
@@ -169,23 +294,68 @@ final class Weft {
 
 			try {
 				$suspended = $step($fiber);
+
+				if ($fiber->isTerminated()) {
+					$this->finish(
+						fiberId: $fiberId,
+						value: $fiber->getReturn(),
+						active: $active,
+						results: $results,
+					);
+					return;
+				}
+
+				if ($suspended instanceof Join) {
+					// Children are already on startQueue from awaitChildren().
+					return;
+				}
+
+				if (!$suspended instanceof Request) {
+					throw new \LogicException('Weft fiber suspended with an unexpected value');
+				}
+
+				$denied = $this->enqueue(fiberId: $fiberId, request: $suspended);
+				if ($task['pending'] > 0) return;
+
+				$step = fn(Fiber $f) => $f->resume($denied);
 			} catch (Throwable $e) {
-				$results[$task['index']] = $e;
-				unset($active[$task['index']], $this->tasks[$fiberId]);
+				$this->finish(fiberId: $fiberId, value: $e, active: $active, results: $results);
 				return;
 			}
-
-			if ($fiber->isTerminated()) {
-				$results[$task['index']] = $fiber->getReturn();
-				unset($active[$task['index']], $this->tasks[$fiberId]);
-				return;
-			}
-
-			$denied = $this->enqueue(fiberId: $fiberId, request: $suspended);
-			if ($task['pending'] > 0) return;
-
-			$step = fn(Fiber $f) => $f->resume($denied);
 		}
+	}
+
+	/**
+	 * @param array<int, true> $active
+	 * @param array<int, mixed> $results
+	 */
+	private function finish(int $fiberId, mixed $value, array &$active, array &$results): void {
+		$task = $this->tasks[$fiberId];
+		unset($active[$fiberId], $this->tasks[$fiberId]);
+
+		$parentId = $task['parentId'];
+		if ($parentId !== null) {
+			if (!isset($this->tasks[$parentId])) return;
+
+			$this->tasks[$parentId]['joinResults'][$task['index']] = $value;
+			$this->tasks[$parentId]['joinLeft']--;
+
+			if ($this->tasks[$parentId]['joinLeft'] > 0) return;
+
+			ksort($this->tasks[$parentId]['joinResults']);
+			$joined = array_values($this->tasks[$parentId]['joinResults']);
+			unset($this->tasks[$parentId]['joinLeft'], $this->tasks[$parentId]['joinResults']);
+
+			$this->advance(
+				fiberId: $parentId,
+				step: fn(Fiber $fiber) => $fiber->resume($joined),
+				active: $active,
+				results: $results,
+			);
+			return;
+		}
+
+		$results[$task['index']] = $value;
 	}
 
 	/**
@@ -218,7 +388,7 @@ final class Weft {
 	}
 
 	/**
-	 * @param array<int, int> $active
+	 * @param array<int, true> $active
 	 * @param array<int, mixed> $results
 	 */
 	private function tick(array &$active, array &$results): void {
@@ -235,7 +405,7 @@ final class Weft {
 	}
 
 	/**
-	 * @param array<int, int> $active
+	 * @param array<int, true> $active
 	 * @param array<int, mixed> $results
 	 */
 	private function complete(CurlHandle $handle, array &$active, array &$results): void {
@@ -271,7 +441,7 @@ final class Weft {
 	}
 
 	/**
-	 * @param array<int, int> $active
+	 * @param array<int, true> $active
 	 * @param array<int, mixed> $results
 	 */
 	private function maybeResume(int $fiberId, array &$active, array &$results): void {
@@ -306,10 +476,7 @@ final class Weft {
 	}
 
 	private function createHandle(Request $request): CurlHandle {
-		$headers = [];
-		if ($this->defaultHeaders !== null) {
-			$headers = ($this->defaultHeaders)();
-		}
+		$headers = $this->headers();
 
 		$options = [
 			CURLOPT_HTTPGET => true,
@@ -343,5 +510,13 @@ final class Weft {
 		$handle = curl_init();
 		curl_setopt_array($handle, $options);
 		return $handle;
+	}
+
+	/**
+	 * @return list<string>
+	 */
+	private function headers(): array {
+		if ($this->defaultHeaders === null) return [];
+		return $this->runHeaders ??= ($this->defaultHeaders)();
 	}
 }
