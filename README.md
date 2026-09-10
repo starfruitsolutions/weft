@@ -19,22 +19,22 @@ $client = new Client();
 **Composed:** several multi-step procedures that may branch between hops. Pass a closure per procedure to `run()`. Each closure is sequential; `send()` inside it suspends so the other closures can keep going.
 
 ```php
-[$claimA, $claimB] = $client->run(
-	fn() => $this->releaseClaim($client, $idA),
-	fn() => $this->releaseClaim($client, $idB),
+[$orderA, $orderB] = $client->run(
+	fn() => $this->submitOrder($client, $idA),
+	fn() => $this->submitOrder($client, $idB),
 );
 
-function releaseClaim(Client $client, string $id): Result {
-	[$release] = $client->send(new Request(
+function submitOrder(Client $client, string $id): Result {
+	[$submit] = $client->send(new Request(
 		method: 'POST',
-		url: "https://api.example.com/claims/{$id}/release",
+		url: "https://api.example.com/orders/{$id}",
 	));
-	if (!$release->isError()) return $release;
+	if (!$submit->isError()) return $submit;
 
 	[$retry] = $client->send(new Request(
 		method: 'POST',
-		url: "https://api.example.com/claims/{$id}/release",
-		body: ['asRecordingOwner' => true],
+		url: "https://api.example.com/orders/{$id}",
+		body: ['force' => true],
 	));
 	return $retry;
 }
