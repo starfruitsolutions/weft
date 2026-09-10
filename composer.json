@@ -1,0 +1,17 @@
+{
+	"name": "weft/weft",
+	"description": "Concurrent HTTP for PHP: Fiber workflows over one long-lived curl_multi handle.",
+	"type": "library",
+	"license": "MIT",
+	"require": {
+		"php": ">=8.4",
+		"ext-curl": "*",
+		"ext-json": "*"
+	},
+	"autoload": {
+		"psr-4": {
+			"Weft\\": "src/"
+		}
+	},
+	"minimum-stability": "stable"
+}
