@@ -261,14 +261,6 @@ final class Client {
 
 		if ($slot['attempt'] < $maxAttempts && $this->isRetryable($result)) {
 			$this->tasks[$fiberId]['pending']--;
-			if ($this->hook !== null) {
-				$skip = $this->hook->before($slot['request']);
-				if ($skip !== null) {
-					$this->tasks[$fiberId]['responses'][$slot['index']] = $skip;
-					$this->maybeResume(fiberId: $fiberId, active: $active, results: $results);
-					return;
-				}
-			}
 			$this->addHandle(
 				fiberId: $fiberId,
 				index: $slot['index'],

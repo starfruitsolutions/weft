@@ -5,20 +5,18 @@ namespace Weft;
 /**
  * Immutable HTTP request for Client::send().
  *
- * $pool / $label are optional context for SendHooks (rate limits, metrics).
- * Callers that do not need them leave them empty.
+ * $context is opaque to the client — SendHooks may read keys they care about.
+ * Leave empty when unused.
  */
 final class Request {
 	/**
 	 * @param array<string, mixed> $body JSON body (empty for GET/DELETE without body)
-	 * @param string $pool Rate-limit / quota pool key for hooks
-	 * @param string $label Display label for hooks (e.g. endpoint name)
+	 * @param array<string, mixed> $context Optional hook/caller metadata
 	 */
 	public function __construct(
 		public readonly string $method,
 		public readonly string $url,
 		public readonly array $body = [],
-		public readonly string $pool = '',
-		public readonly string $label = '',
+		public readonly array $context = [],
 	) {}
 }

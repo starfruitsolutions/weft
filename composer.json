@@ -3,6 +3,16 @@
 	"description": "Concurrent HTTP for PHP: Fiber workflows over one long-lived curl_multi handle.",
 	"type": "library",
 	"license": "MIT",
+	"homepage": "https://github.com/starfruitsolutions/weft",
+	"authors": [
+		{
+			"name": "Bradlee Nichols"
+		}
+	],
+	"support": {
+		"issues": "https://github.com/starfruitsolutions/weft/issues",
+		"source": "https://github.com/starfruitsolutions/weft"
+	},
 	"require": {
 		"php": ">=8.4",
 		"ext-curl": "*",
