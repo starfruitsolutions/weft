@@ -58,7 +58,7 @@ function loadOrder(Weft $weft, string $id): array {
 ## Install
 
 ```bash
-composer require weft/weft
+composer require starfruitsolutions/weft
 ```
 
 Until the package is on Packagist, add the GitHub repo:
@@ -73,7 +73,7 @@ Until the package is on Packagist, add the GitHub repo:
 	],
 	"require": {
 		"php": ">=8.4",
-		"weft/weft": "dev-main"
+		"starfruitsolutions/weft": "dev-main"
 	}
 }
 ```

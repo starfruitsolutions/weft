@@ -1,5 +1,5 @@
 {
-	"name": "weft/weft",
+	"name": "starfruitsolutions/weft",
 	"description": "Concurrent HTTP for PHP: Fiber workflows over one long-lived curl_multi handle.",
 	"type": "library",
 	"license": "MIT",
