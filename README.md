@@ -1,6 +1,8 @@
 # Weft
 
-Concurrent HTTP for PHP 8.4+. On a loom, the weft is the yarn that runs across the warp. Here, PHP fibers are the threads: each workflow calls `send()`, suspends, joins one shared `curl_multi` handle, and resumes as soon as *its* transfers finish. There is no barrier across workflows.
+Concurrent HTTP for PHP 8.4+. On a loom, the weft is the yarn that runs across the warp. Here, requests and workflows are the threads: they share one `curl_multi` handle and resume as they finish.
+
+**Direct:** several independent requests, one hop. Pass them all to `send()`.
 
 ```php
 use Weft\Client;
@@ -8,13 +10,37 @@ use Weft\Request;
 
 $client = new Client();
 
-[$a, $b] = $client->run(
-	fn() => $client->send(new Request(method: 'GET', url: 'https://example.com/a'))[0],
-	fn() => $client->send(new Request(method: 'GET', url: 'https://example.com/b'))[0],
+[$a, $b] = $client->send(
+	new Request(method: 'GET', url: 'https://example.com/a'),
+	new Request(method: 'GET', url: 'https://example.com/b'),
 );
 ```
 
-`send()` outside `run()` is a one-shot: it starts a single workflow, waits, and returns `list<Result>`.
+**Composed:** several multi-step procedures that may branch between hops. Pass a closure per procedure to `run()`. Each closure is sequential; `send()` inside it suspends so the other closures can keep going.
+
+```php
+[$claimA, $claimB] = $client->run(
+	fn() => $this->releaseClaim($client, $idA),
+	fn() => $this->releaseClaim($client, $idB),
+);
+
+function releaseClaim(Client $client, string $id): Result {
+	[$release] = $client->send(new Request(
+		method: 'POST',
+		url: "https://api.example.com/claims/{$id}/release",
+	));
+	if (!$release->isError()) return $release;
+
+	[$retry] = $client->send(new Request(
+		method: 'POST',
+		url: "https://api.example.com/claims/{$id}/release",
+		body: ['asRecordingOwner' => true],
+	));
+	return $retry;
+}
+```
+
+Fan-out of requests → `send(...)`. Fan-out of procedures → `run(fn() => ...)`.
 
 ## Install
 
@@ -73,16 +99,11 @@ $array = $result->toArray();
 
 ## Workflows
 
-`run()` starts callables as fibers. A workflow that throws is stored as that `Throwable` at its index; `run()` itself does not throw, so sibling results stay available.
+`run()` starts one fiber per callable. A workflow that throws is stored as that `Throwable` at its index; `run()` itself does not throw, so sibling results stay available.
 
-```php
-$results = $client->run(
-	fn() => doThing($idA),
-	fn() => doThing($idB),
-);
-```
+Inside a workflow, `send(...$requests)` suspends until every handle in *that* call finishes. Other workflows keep transferring on the same `curl_multi`. A `send()` with several arguments is still one hop: those requests complete together before the closure continues.
 
-Inside a workflow, `send(...$requests)` suspends until every handle in that call finishes. Independent workflows overlap on the same `curl_multi`.
+`send()` outside `run()` is a one-shot of that same hop.
 
 Workflow concurrency (not request count) defaults to 25:
 
