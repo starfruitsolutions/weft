@@ -2,12 +2,16 @@
 
 namespace Weft;
 
+use ArrayAccess;
+use JsonSerializable;
+use LogicException;
+
 /**
  * Decoded HTTP response body. ArrayAccess mirrors a JSON object shape.
  *
- * @implements \ArrayAccess<string, mixed>
+ * @implements ArrayAccess<string, mixed>
  */
-final class Result implements \ArrayAccess, \JsonSerializable {
+final class Result implements ArrayAccess, JsonSerializable {
 	/**
 	 * @param array<string, mixed> $body
 	 */
@@ -59,12 +63,18 @@ final class Result implements \ArrayAccess, \JsonSerializable {
 		return $this->body[$offset] ?? null;
 	}
 
+	/**
+	 * @throws LogicException Always — Result is immutable
+	 */
 	public function offsetSet(mixed $offset, mixed $value): void {
-		throw new \LogicException('Result is immutable');
+		throw new LogicException('Result is immutable');
 	}
 
+	/**
+	 * @throws LogicException Always — Result is immutable
+	 */
 	public function offsetUnset(mixed $offset): void {
-		throw new \LogicException('Result is immutable');
+		throw new LogicException('Result is immutable');
 	}
 
 	/**

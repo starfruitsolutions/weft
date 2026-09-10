@@ -5,6 +5,7 @@ namespace Weft;
 use CurlHandle;
 use CurlMultiHandle;
 use Fiber;
+use LogicException;
 use Throwable;
 
 /**
@@ -51,6 +52,7 @@ final class Weft {
 	 *   request: Request,
 	 *   attempt: int,
 	 *   startedAt: float,
+	 *   handle: CurlHandle,
 	 * }>
 	 */
 	private array $inFlight = [];
@@ -106,6 +108,7 @@ final class Weft {
 	 *
 	 * @param array<string, mixed> $body
 	 * @param array<string, mixed> $context Opaque hook/caller metadata
+	 * @throws Throwable When a one-shot run fails before producing a Result
 	 */
 	public function request(string $method, string $url, array $body = [], array $context = []): Result {
 		$request = new Request(method: $method, url: $url, body: $body, context: $context);
@@ -220,19 +223,40 @@ final class Weft {
 				foreach (array_keys($active) as $fiberId) {
 					$this->finish(
 						fiberId: $fiberId,
-						value: new \LogicException('Weft event loop stalled with active fibers'),
+						value: new LogicException('Weft event loop stalled with active fibers'),
 						active: $active,
 						results: $results,
 					);
 				}
 			}
 		} finally {
-			$this->runHeaders = null;
-			$this->startQueue = [];
+			$this->cleanupAfterDrive();
 		}
 
 		ksort($results);
 		return array_values($results);
+	}
+
+	/**
+	 * Drop in-flight handles and scheduler state so a reused instance stays usable
+	 * after a normal finish or an exceptional abort.
+	 */
+	private function cleanupAfterDrive(): void {
+		$this->runHeaders = null;
+		$this->startQueue = [];
+
+		if ($this->multi !== null) {
+			foreach ($this->inFlight as $slot) {
+				$handle = $slot['handle'];
+				curl_multi_remove_handle($this->multi, $handle);
+				curl_close($handle);
+			}
+			curl_multi_close($this->multi);
+			$this->multi = null;
+		}
+
+		$this->inFlight = [];
+		$this->tasks = [];
 	}
 
 	/**
@@ -311,7 +335,7 @@ final class Weft {
 				}
 
 				if (!$suspended instanceof Request) {
-					throw new \LogicException('Weft fiber suspended with an unexpected value');
+					throw new LogicException('Weft fiber suspended with an unexpected value');
 				}
 
 				$denied = $this->enqueue(fiberId: $fiberId, request: $suspended);
@@ -383,6 +407,7 @@ final class Weft {
 			'request' => $request,
 			'attempt' => $attempt,
 			'startedAt' => microtime(true),
+			'handle' => $handle,
 		];
 		$this->tasks[$fiberId]['pending']++;
 	}
